@@ -52,14 +52,13 @@ def train(model, train_dataloader,eval_dataloader, tokenizer, optimizer, lr_sche
     Returns: results dictionary containing average training and validation perplexity and loss
     """
     # Create a gradient scaler for fp16
-    if train_config.use_fp16 and train_config.enable_fsdp:
+    if train_config.use_fp16 and rank is not None:
         scaler = ShardedGradScaler()
-    elif train_config.use_fp16 and not train_config.enable_fsdp:
+    elif train_config.use_fp16 and rank is None:
         scaler = torch.cuda.amp.GradScaler()
-    if train_config.enable_fsdp:
+    if rank is not None:
         world_size = int(os.environ["WORLD_SIZE"]) 
 
-    
 
     autocast = torch.cuda.amp.autocast if train_config.use_fp16 else nullcontext
 
@@ -74,7 +73,7 @@ def train(model, train_dataloader,eval_dataloader, tokenizer, optimizer, lr_sche
         train_step_loss = []
         val_step_loss = []
         val_step_perplexity = []
-        
+
     epoch_times = []
     checkpoint_times = []
     results = {}
@@ -84,11 +83,15 @@ def train(model, train_dataloader,eval_dataloader, tokenizer, optimizer, lr_sche
         with MemoryTrace() as memtrace:  # track the memory usage
             model.train()
             total_loss = 0.0
-            total_length = len(train_dataloader)//gradient_accumulation_steps
+            max_steps = min(len(train_dataloader), train_config.max_steps_per_epoch)
+            total_length = max_steps // gradient_accumulation_steps
             pbar = tqdm(colour="blue", desc=f"Training Epoch: {epoch+1}", total=total_length, dynamic_ncols=True)
             for step, batch in enumerate(train_dataloader):
+                if step == 3:
+                    torch.cuda.profiler.start()
+                torch.cuda.nvtx.range_push(f"batch {step}")
                 for key in batch.keys():
-                    if train_config.enable_fsdp:
+                    if local_rank is not None:
                         if is_xpu_available():
                             batch[key] = batch[key].to(torch.device(f"xpu:{local_rank}"))
                         else:
@@ -109,7 +112,7 @@ def train(model, train_dataloader,eval_dataloader, tokenizer, optimizer, lr_sche
                 if train_config.use_fp16:
                     # if fp16 is enabled, use gradient scaler to handle gradient update
                     scaler.scale(loss).backward()
-                    if (step + 1) % gradient_accumulation_steps == 0 or step == len(train_dataloader) - 1:
+                    if (step + 1) % gradient_accumulation_steps == 0 or step == max_steps - 1:
                         if train_config.gradient_clipping and train_config.gradient_clipping_threshold > 0.0:
                             scaler.unscale_(optimizer)
                             if train_config.enable_fsdp:
@@ -123,7 +126,7 @@ def train(model, train_dataloader,eval_dataloader, tokenizer, optimizer, lr_sche
                 else:
                     # regular backpropagation when fp16 is not used
                     loss.backward()
-                    if (step + 1) % gradient_accumulation_steps == 0 or step == len(train_dataloader) - 1:
+                    if (step + 1) % gradient_accumulation_steps == 0 or step == max_steps - 1:
                         if train_config.gradient_clipping and train_config.gradient_clipping_threshold > 0.0:
                             if train_config.enable_fsdp:
                                 model.clip_grad_norm_(train_config.gradient_clipping_threshold)
@@ -132,53 +135,35 @@ def train(model, train_dataloader,eval_dataloader, tokenizer, optimizer, lr_sche
                         optimizer.step()
                         optimizer.zero_grad()
                         pbar.update(1)
+                torch.cuda.nvtx.range_pop()
+                if step == 5:
+                    torch.cuda.profiler.stop()
 
-                pbar.set_description(f"Training Epoch: {epoch+1}/{train_config.num_epochs}, step {step}/{len(train_dataloader)} completed (loss: {loss.detach().float()})")
+                pbar.set_description(f"Training Epoch: {epoch+1}/{train_config.num_epochs}, step {step}/{max_steps} completed (loss: {loss.detach().float()})")
 
                 if train_config.save_metrics:
                     save_to_json(metrics_filename, train_step_loss, train_loss, train_step_perplexity, train_prep, val_step_loss, val_loss, val_step_perplexity, val_prep)
+                if step + 1 >= max_steps:
+                    break
             pbar.close()
 
         epoch_end_time = time.perf_counter()-epoch_start_time
         epoch_times.append(epoch_end_time)
         # Reducing total_loss across all devices if there's more than one CUDA device
-        if is_xpu_available() and (torch.xpu.device_count() > 1 and train_config.enable_fsdp):
+        if is_xpu_available() and (torch.xpu.device_count() > 1 and rank is not None):
             dist.all_reduce(total_loss, op=dist.ReduceOp.SUM)
-        elif torch.cuda.device_count() > 1 and train_config.enable_fsdp:
+        elif torch.cuda.device_count() > 1 and rank is not None:
             dist.all_reduce(total_loss, op=dist.ReduceOp.SUM)
-        train_epoch_loss = total_loss / len(train_dataloader)
-        if train_config.enable_fsdp:
+        train_epoch_loss = total_loss / max_steps
+        if rank is not None:
             train_epoch_loss = train_epoch_loss/world_size
         train_perplexity = torch.exp(train_epoch_loss)
         
         train_prep.append(float(train_perplexity))
         train_loss.append(float(train_epoch_loss))
         
-        if train_config.enable_fsdp:
-            if rank==0:
-                if is_xpu_available():
-                    print(f"Max XPU memory allocated was {memtrace.peak} GB")
-                    print(f"Max XPU memory reserved was {memtrace.max_reserved} GB")
-                    print(f"Peak active XPU memory was {memtrace.peak_active_gb} GB")
-                    print(f"Xpu Malloc retires : {memtrace.xpu_malloc_retires}")
-                else:
-                    print(f"Max CUDA memory allocated was {memtrace.peak} GB")
-                    print(f"Max CUDA memory reserved was {memtrace.max_reserved} GB")
-                    print(f"Peak active CUDA memory was {memtrace.peak_active_gb} GB")
-                    print(f"Cuda Malloc retires : {memtrace.cuda_malloc_retires}")
-                print(f"CPU Total Peak Memory consumed during the train (max): {memtrace.cpu_peaked + memtrace.cpu_begin} GB")
-        else:
-            if is_xpu_available():
-                print(f"Max XPU memory allocated was {memtrace.peak} GB")
-                print(f"Max XPU memory reserved was {memtrace.max_reserved} GB")
-                print(f"Peak active XPU memory was {memtrace.peak_active_gb} GB")
-                print(f"Xpu Malloc retires : {memtrace.xpu_malloc_retires}")
-            else:
-                print(f"Max CUDA memory allocated was {memtrace.peak} GB")
-                print(f"Max CUDA memory reserved was {memtrace.max_reserved} GB")
-                print(f"Peak active CUDA memory was {memtrace.peak_active_gb} GB")
-                print(f"Cuda Malloc retires : {memtrace.cuda_malloc_retires}")
-            print(f"CPU Total Peak Memory consumed during the train (max): {memtrace.cpu_peaked + memtrace.cpu_begin} GB")
+        if rank is None or rank==0:
+            memtrace.print_stats()
 
         # Update the learning rate as needed
         lr_scheduler.step()
@@ -191,16 +176,16 @@ def train(model, train_dataloader,eval_dataloader, tokenizer, optimizer, lr_sche
 
             checkpoint_start_time = time.perf_counter()
             if train_config.save_model and eval_epoch_loss < best_val_loss:
-                if train_config.enable_fsdp:
+                if rank is not None:
                     dist.barrier()
                 if train_config.use_peft:
-                    if train_config.enable_fsdp:
+                    if rank is not None:
                         if rank==0:
                             print(f"we are about to save the PEFT modules")
                     else:
                         print(f"we are about to save the PEFT modules")
                     model.save_pretrained(train_config.output_dir)
-                    if train_config.enable_fsdp:
+                    if rank is not None:
                         if rank==0:
                             print(f"PEFT modules are saved in {train_config.output_dir} directory")
                     else:
@@ -228,20 +213,20 @@ def train(model, train_dataloader,eval_dataloader, tokenizer, optimizer, lr_sche
                         )
                         print(" Saving the FSDP model checkpoints and optimizer using FULL_STATE_DICT")
                         print("=====================================================")
-                if train_config.enable_fsdp:
+                if rank is not None:
                     dist.barrier()
             checkpoint_end_time = time.perf_counter() - checkpoint_start_time
             checkpoint_times.append(checkpoint_end_time)
             if eval_epoch_loss < best_val_loss:
                 best_val_loss = eval_epoch_loss
-                if train_config.enable_fsdp:
+                if rank is not None:
                     if rank==0:
                         print(f"best eval loss on epoch {epoch+1} is {best_val_loss}")
                 else:
                     print(f"best eval loss on epoch {epoch+1} is {best_val_loss}")
             val_loss.append(float(best_val_loss))
             val_prep.append(float(eval_ppl))
-        if train_config.enable_fsdp:
+        if rank is not None:
             if rank==0:
                 print(f"Epoch {epoch+1}: train_perplexity={train_perplexity:.4f}, train_epoch_loss={train_epoch_loss:.4f}, epoch time {epoch_end_time}s")
         else:
@@ -270,8 +255,8 @@ def train(model, train_dataloader,eval_dataloader, tokenizer, optimizer, lr_sche
         results["metrics_filename"] = metrics_filename
 
     #saving the training params including fsdp setting for reference.
-    if train_config.enable_fsdp and not train_config.use_peft:
-        save_train_params(train_config, fsdp_config, rank)
+    if train_config.enable_fsdp and not train_config.use_peft and rank == 0:
+        save_train_params(train_config, fsdp_config)
 
     return results
 
@@ -287,7 +272,7 @@ def evaluation(model,train_config, eval_dataloader, local_rank, tokenizer):
 
     Returns: eval_ppl, eval_epoch_loss
     """
-    if train_config.enable_fsdp:
+    if local_rank is not None:
         world_size = int(os.environ["WORLD_SIZE"])
     model.eval()
     eval_preds = []
@@ -297,7 +282,7 @@ def evaluation(model,train_config, eval_dataloader, local_rank, tokenizer):
     with MemoryTrace() as memtrace:
         for step, batch in enumerate(tqdm(eval_dataloader,colour="green", desc="evaluating Epoch", dynamic_ncols=True)):
             for key in batch.keys():
-                if train_config.enable_fsdp:
+                if local_rank is not None:
                     batch[key] = batch[key].to(local_rank)
                 else:
                     if is_xpu_available():
@@ -321,19 +306,19 @@ def evaluation(model,train_config, eval_dataloader, local_rank, tokenizer):
             )
 
     # If there's more than one CUDA device, reduce evaluation loss across all devices
-    if is_xpu_available() and (torch.xpu.device_count() > 1 and train_config.enable_fsdp):
+    if is_xpu_available() and (torch.xpu.device_count() > 1 and rank is not None):
         dist.all_reduce(eval_loss, op=dist.ReduceOp.SUM)
-    if torch.cuda.device_count() > 1 and train_config.enable_fsdp:
+    if torch.cuda.device_count() > 1 and rank is not None:
         dist.all_reduce(eval_loss, op=dist.ReduceOp.SUM)
 
     # Compute average loss and perplexity
     eval_epoch_loss = eval_loss / len(eval_dataloader)
-    if train_config.enable_fsdp:
+    if rank is not None:
         eval_epoch_loss = eval_epoch_loss/world_size
     eval_ppl = torch.exp(eval_epoch_loss)
 
     # Print evaluation metrics
-    if train_config.enable_fsdp:
+    if local_rank is not None:
         if local_rank==0:
             print(f" {eval_ppl=} {eval_epoch_loss=}")
     else:
@@ -450,7 +435,7 @@ def get_policies(cfg, rank):
     wrapping_policy = get_llama_wrapper()
     return mixed_precision_policy, wrapping_policy
 
-def save_train_params(train_config, fsdp_config, rank):
+def save_train_params(train_config, fsdp_config):
     """
     This function saves the train_config and FSDP config into a train_params.yaml.
     This will be used by converter script in the inference folder to fetch the HF model name or path.
@@ -473,8 +458,7 @@ def save_train_params(train_config, fsdp_config, rank):
 
     save_dir = Path.cwd() / folder_name
     # If the directory does not exist, create it
-    if not os.path.exists(save_dir):
-        os.makedirs(save_dir)
+    os.makedirs(save_dir, exist_ok=True)
     # Convert the dictionary to a YAML string
     config_yaml = yaml.dump(train_params_dict, indent=4)
     file_name = os.path.join(save_dir,'train_params.yaml')
@@ -486,8 +470,7 @@ def save_train_params(train_config, fsdp_config, rank):
         # Write the YAML string to the file
         with open(file_name, 'w') as f:
             f.write(config_yaml)
-        if rank==0:
-            print(f"training params are saved in {file_name}")
+        print(f"training params are saved in {file_name}")
 
 def save_to_json(output_filename, train_step_loss, train_epoch_loss, train_step_ppl, train_epoch_ppl, val_step_loss, val_epoch_loss, val_step_ppl, val_epoch_ppl):
     metrics_data = {

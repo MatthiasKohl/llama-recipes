@@ -1178,6 +1178,9 @@ gradio
 pdf
 quantized
 streamlit
+HSDP
+ShardingStrategy
+hsdp
 prem
 Prem
 OpenAI
@@ -1226,6 +1229,7 @@ jsonl
 VRAM
 HuggingFace
 llamaguard
+LEVELs
 AugmentationConfigs
 FormatterConfigs
 LlamaGuardGenerationConfigs

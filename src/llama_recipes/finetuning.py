@@ -11,7 +11,9 @@ import torch.optim as optim
 from peft import get_peft_model, prepare_model_for_int8_training
 from torch.distributed.fsdp import (
     FullyShardedDataParallel as FSDP,
+    ShardingStrategy
 )
+
 from torch.distributed.fsdp.fully_sharded_data_parallel import CPUOffload
 from torch.optim.lr_scheduler import StepLR
 from transformers import (
@@ -35,6 +37,7 @@ from llama_recipes.utils.config_utils import (
 )
 from llama_recipes.utils.dataset_utils import get_preprocessed_dataset
 
+from llama_recipes.utils.fsdp_utils import hsdp_device_mesh
 from llama_recipes.utils.train_utils import (
     train,
     freeze_transformer_layers,
@@ -42,9 +45,13 @@ from llama_recipes.utils.train_utils import (
     setup_environ_flags,
     clear_gpu_cache,
     print_model_size,
-    get_policies
+    get_policies,
 )
 from accelerate.utils import is_xpu_available
+
+from .interleaved_offload import OffloadingWrapper
+from .apply_optimizer_in_backward_patched import _apply_optimizer_in_backward
+from torch.nn.parallel import DistributedDataParallel
 
 def main(**kwargs):
     # Update the configuration for the training and sharding process
@@ -54,12 +61,12 @@ def main(**kwargs):
     # Set the seeds for reproducibility
     if is_xpu_available():
         torch.xpu.manual_seed(train_config.seed)
-    else:
-        torch.cuda.manual_seed(train_config.seed)
     torch.manual_seed(train_config.seed)
     random.seed(train_config.seed)
 
-    if train_config.enable_fsdp:
+    is_dist = train_config.enable_fsdp or fsdp_config.interleaved_ddp
+
+    if is_dist:
         setup()
         # torchrun specific
         local_rank = int(os.environ["LOCAL_RANK"])
@@ -69,7 +76,7 @@ def main(**kwargs):
     if torch.distributed.is_initialized():
         if is_xpu_available():
             torch.xpu.set_device(local_rank)
-        else:
+        elif torch.cuda.is_available():
             torch.cuda.set_device(local_rank)
         clear_gpu_cache(local_rank)
         setup_environ_flags(rank)
@@ -84,7 +91,9 @@ def main(**kwargs):
         overhead and currently requires latest nightly.
         """
         v = packaging.version.parse(torch.__version__)
-        verify_latest_nightly = v.is_devrelease and v.dev >= 20230701
+        verify_latest_nightly = (
+            (v.is_devrelease and v.dev >= 20230701) or (v.major >= 2 and v.minor >= 2)
+        )
         if not verify_latest_nightly:
             raise Exception("latest pytorch nightly build is required to run with low_cpu_fsdp config, "
                             "please install latest nightly.")
@@ -94,6 +103,7 @@ def main(**kwargs):
                 load_in_8bit=True if train_config.quantization else None,
                 device_map="auto" if train_config.quantization else None,
                 use_cache=use_cache,
+                attn_implementation="sdpa" if train_config.use_fast_kernels else None,
             )
         else:
             llama_config = LlamaConfig.from_pretrained(train_config.model_name)
@@ -107,24 +117,14 @@ def main(**kwargs):
             load_in_8bit=True if train_config.quantization else None,
             device_map="auto" if train_config.quantization else None,
             use_cache=use_cache,
+            attn_implementation="sdpa" if train_config.use_fast_kernels else None,
         )
-    if train_config.enable_fsdp and train_config.use_fast_kernels:
-        """
-        For FSDP and FSDP+PEFT, setting 'use_fast_kernels' will enable
-        using of Flash Attention or Xformer memory-efficient kernels
-        based on the hardware being used. This would speed up fine-tuning.
-        """
-        try:
-            from optimum.bettertransformer import BetterTransformer
-            model = BetterTransformer.transform(model)
-        except ImportError:
-            print("Module 'optimum' not found. Please install 'optimum' it before proceeding.")
 
     # Load the tokenizer and add special tokens
     tokenizer = LlamaTokenizer.from_pretrained(train_config.model_name)
     tokenizer.pad_token_id = tokenizer.eos_token_id
 
-    print_model_size(model, train_config, rank if train_config.enable_fsdp else 0)
+    print_model_size(model, train_config, rank if is_dist else 0)
 
     # Prepare the model for int8 training if quantization is enabled
     if train_config.quantization:
@@ -138,15 +138,48 @@ def main(**kwargs):
         peft_config = generate_peft_config(train_config, kwargs)
         model = get_peft_model(model, peft_config)
         model.print_trainable_parameters()
-
+        
+    hsdp_device_mesh = None
+    if fsdp_config.hsdp and fsdp_config.sharding_strategy == ShardingStrategy.HYBRID_SHARD:
+        hsdp_device_mesh = hsdp_device_mesh(replica_group_size=fsdp_config.replica_group_size, sharding_group_size=fsdp_config.sharding_group_size)
+        print("HSDP device mesh is ready")
+        
     #setting up FSDP if enable_fsdp is enabled
-    if train_config.enable_fsdp:
+    do_interleaved = (fsdp_config.interleaved_offload_param != 0 or
+                      fsdp_config.interleaved_offload_act != 0)
+    if do_interleaved:
+        if fsdp_config.pure_bf16:
+            model.to(torch.bfloat16)
+        model = OffloadingWrapper(
+            model, LlamaDecoderLayer, device=torch.cuda.current_device(),
+            num_blocks_params=fsdp_config.interleaved_offload_param,
+            num_blocks_act=fsdp_config.interleaved_offload_act,
+            only_frozen_params=fsdp_config.interleaved_ddp)
+        if fsdp_config.interleaved_ddp:
+            # for DDP, we apply offloading only to the frozen params
+            # (for now, DDP and interleaved offloading are not aware of each other).
+            # Plus, we must set any frozen parameters as ignored by DDP:
+            # even though DDP doesn't apply to frozen parameters, it still attempts
+            # to synchronize the module initially including frozen parameters,
+            # which does not work with models that are partially offloaded
+            # finally, we use a static graph for DDP since the wrapper already
+            # assumes having a static graph
+            params_to_ignore = set(n for n, p in model.named_parameters() if not p.requires_grad)
+            DistributedDataParallel._set_params_and_buffers_to_ignore_for_model(model, params_to_ignore)
+            model = DistributedDataParallel(model, static_graph=True)
+    elif train_config.enable_fsdp:
         if not train_config.use_peft and train_config.freeze_layers:
 
             freeze_transformer_layers(train_config.num_freeze_layers)
 
         mixed_precision_policy, wrapping_policy = get_policies(fsdp_config, rank)
         my_auto_wrapping_policy = fsdp_auto_wrap_policy(model, LlamaDecoderLayer)
+        
+        device_id = 0
+        if is_xpu_available():
+            device_id = torch.xpu.current_device()
+        elif torch.cuda.is_available():
+            device_id = torch.cuda.current_device()
 
         model = FSDP(
             model,
@@ -154,18 +187,20 @@ def main(**kwargs):
             cpu_offload=CPUOffload(offload_params=True) if fsdp_config.fsdp_cpu_offload else None,
             mixed_precision=mixed_precision_policy if not fsdp_config.pure_bf16 else None,
             sharding_strategy=fsdp_config.sharding_strategy,
-            device_id=torch.xpu.current_device() if is_xpu_available() else torch.cuda.current_device(),
+            device_mesh=hsdp_device_mesh,
+            device_id=device_id,
             limit_all_gathers=True,
             sync_module_states=train_config.low_cpu_fsdp,
             param_init_fn=lambda module: module.to_empty(device=torch.device("cuda"), recurse=False)
             if train_config.low_cpu_fsdp and rank != 0 else None,
+            use_orig_params=train_config.apply_optim_backward,
         )
         if fsdp_config.fsdp_activation_checkpointing:
             apply_fsdp_checkpointing(model)
     elif not train_config.quantization and not train_config.enable_fsdp:
         if is_xpu_available():
             model.to("xpu:0")
-        else:
+        elif torch.cuda.is_available():
             model.to("cuda")
 
     dataset_config = generate_dataset_config(train_config, kwargs)
@@ -177,7 +212,7 @@ def main(**kwargs):
         split="train",
     )
 
-    if not train_config.enable_fsdp or rank == 0:
+    if not is_dist or rank == 0:
         print(f"--> Training Set Length = {len(dataset_train)}")
 
     dataset_val = get_preprocessed_dataset(
@@ -185,7 +220,7 @@ def main(**kwargs):
         dataset_config,
         split="test",
     )
-    if not train_config.enable_fsdp or rank == 0:
+    if not is_dist or rank == 0:
             print(f"--> Validation Set Length = {len(dataset_val)}")
 
     if train_config.batching_strategy == "packing":
@@ -217,20 +252,38 @@ def main(**kwargs):
 
     # Initialize the optimizer and learning rate scheduler
     if fsdp_config.pure_bf16 and fsdp_config.optimizer == "anyprecision":
-        optimizer = AnyPrecisionAdamW(
-            model.parameters(),
-            lr=train_config.lr,
-            momentum_dtype=torch.bfloat16,
-            variance_dtype=torch.bfloat16,
-            use_kahan_summation=False,
-            weight_decay=train_config.weight_decay,
-        )
+        optimizer_class = AnyPrecisionAdamW
+        optimizer_kwargs = {
+            "lr": train_config.lr,
+            "momentum_dtype": torch.bfloat16,
+            "variance_dtype": torch.bfloat16,
+            "use_kahan_summation": False,
+            "weight_decay": train_config.weight_decay,
+        }
     else:
-        optimizer = optim.AdamW(
-            model.parameters(),
-            lr=train_config.lr,
-            weight_decay=train_config.weight_decay,
+        optimizer_class = optim.AdamW
+        optimizer_kwargs = {
+            "lr": train_config.lr, "weight_decay": train_config.weight_decay
+        }
+
+    if train_config.apply_optim_backward:
+        assert not train_config.use_fp16 and not fsdp_config.use_fp16,\
+            "cannot use FP16 with optimizer in backward!"
+        if not is_dist or rank == 0:
+            print(f"--> Applying optimizer in backward directly !")
+        _apply_optimizer_in_backward(
+            optimizer_class, params=model.parameters(), optimizer_kwargs=optimizer_kwargs
         )
+        # TODO ideally, we should properly handle scheduler s.t. it combines
+        # all optimizers, and the optimizer given to other functions should
+        # also save state correctly
+        first_p = next((
+            p for p in model.parameters() if hasattr(p, "_in_backward_optimizers")
+        ), None)
+        assert first_p is not None, "Must have at least one trainable parameter"
+        optimizer = first_p._in_backward_optimizers[0]
+    else:
+        optimizer = optimizer_class(model.parameters(), **optimizer_kwargs)
     scheduler = StepLR(optimizer, step_size=1, gamma=train_config.gamma)
 
     # Start the training process
@@ -244,8 +297,8 @@ def main(**kwargs):
         train_config.gradient_accumulation_steps,
         train_config,
         fsdp_config if train_config.enable_fsdp else None,
-        local_rank if train_config.enable_fsdp else None,
-        rank if train_config.enable_fsdp else None,
+        local_rank if is_dist else None,
+        rank if is_dist else None,
     )
     if not train_config.enable_fsdp or rank==0:
         [print(f'Key: {k}, Value: {v}') for k, v in results.items()]

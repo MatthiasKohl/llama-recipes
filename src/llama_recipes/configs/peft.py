@@ -23,4 +23,4 @@ class llama_adapter_config:
 @dataclass
 class prefix_config:
      num_virtual_tokens: int=30
-     task_type: str= "CAUSAL_LM"    
+     task_type: str= "CAUSAL_LM"
